@@ -33,7 +33,7 @@ on:
       aws_region:
         description: "AWS Region for Security Group modification"
         required: false
-        default: "us-east-1"
+        default: "ap-southeast-2"
         type: string
     secrets:
       SSH_PRIVATE_KEY:
@@ -56,16 +56,23 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Fetch GitHub Runner Public IP
-        id: runner-ip
-        if: ${{ inputs.aws_sg_id != '' }}
+      - name: Check AWS SG Dynamic Whitelisting
+        id: check-aws
+        env:
+          AWS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
         run: |
-          RUNNER_IP=$(curl -s https://checkip.amazonaws.com)
-          echo "RUNNER_IP=${RUNNER_IP}" >> $GITHUB_ENV
-          echo "Runner IP: ${RUNNER_IP}"
+          if [ -n "${{ inputs.aws_sg_id }}" ] && [ -n "$AWS_KEY" ]; then
+            echo "enabled=true" >> $GITHUB_OUTPUT
+            RUNNER_IP=$(curl -s https://checkip.amazonaws.com)
+            echo "runner_ip=${RUNNER_IP}" >> $GITHUB_OUTPUT
+            echo "Dynamic SG whitelisting enabled for IP: ${RUNNER_IP}"
+          else
+            echo "enabled=false" >> $GITHUB_OUTPUT
+            echo "Dynamic SG whitelisting skipped (Direct SSH mode active)"
+          fi
 
       - name: Configure AWS Credentials (Optional SG Whitelisting)
-        if: ${{ inputs.aws_sg_id != '' && secrets.AWS_ACCESS_KEY_ID != '' }}
+        if: steps.check-aws.outputs.enabled == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -73,14 +80,15 @@ jobs:
           aws-region: ${{ inputs.aws_region }}
 
       - name: Whitelist Runner IP in AWS Security Group
-        if: ${{ inputs.aws_sg_id != '' && secrets.AWS_ACCESS_KEY_ID != '' }}
+        if: steps.check-aws.outputs.enabled == 'true'
         run: |
+          RUNNER_IP="${{ steps.check-aws.outputs.runner_ip }}"
           echo "Temporarily whitelisting ${RUNNER_IP}/32 for port ${{ inputs.target_port }} in ${{ inputs.aws_sg_id }}..."
           aws ec2 authorize-security-group-ingress \
             --group-id ${{ inputs.aws_sg_id }} \
             --protocol tcp \
             --port ${{ inputs.target_port }} \
-            --cidr ${RUNNER_IP}/32 || true
+            --cidr "${RUNNER_IP}/32" || true
 
       - name: Configure SSH Key
         run: |
@@ -104,11 +112,12 @@ jobs:
           ssh -p ${{ inputs.target_port }} ${{ inputs.target_user }}@${{ inputs.target_host }} "${{ inputs.deploy_cmd }}"
 
       - name: Revoke Runner IP from AWS Security Group
-        if: always() && inputs.aws_sg_id != '' && secrets.AWS_ACCESS_KEY_ID != ''
+        if: always() && steps.check-aws.outputs.enabled == 'true'
         run: |
+          RUNNER_IP="${{ steps.check-aws.outputs.runner_ip }}"
           echo "Revoking temporary whitelisted IP ${RUNNER_IP}/32 from ${{ inputs.aws_sg_id }}..."
           aws ec2 revoke-security-group-ingress \
             --group-id ${{ inputs.aws_sg_id }} \
             --protocol tcp \
             --port ${{ inputs.target_port }} \
-            --cidr ${RUNNER_IP}/32 || true
+            --cidr "${RUNNER_IP}/32" || true
