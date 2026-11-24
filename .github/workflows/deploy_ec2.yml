@@ -1,0 +1,114 @@
+name: Reusable EC2 Deployment Workflow
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Target Environment (e.g. STG, PROD)"
+        required: true
+        type: string
+      target_host:
+        description: "Target EC2 Public/Private Host or IP"
+        required: true
+        type: string
+      target_user:
+        description: "SSH Username on target machine"
+        required: false
+        default: "ubuntu"
+        type: string
+      target_port:
+        description: "SSH Port on target machine"
+        required: false
+        default: 22
+        type: number
+      deploy_cmd:
+        description: "Command or script to execute on target machine"
+        required: true
+        type: string
+      aws_sg_id:
+        description: "Optional AWS Security Group ID for dynamic IP ingress/egress whitelisting"
+        required: false
+        default: ""
+        type: string
+      aws_region:
+        description: "AWS Region for Security Group modification"
+        required: false
+        default: "us-east-1"
+        type: string
+    secrets:
+      SSH_PRIVATE_KEY:
+        description: "SSH Private Key for authenticating to the target EC2 machine"
+        required: true
+      AWS_ACCESS_KEY_ID:
+        description: "Optional AWS Access Key ID for dynamic SG rule whitelisting"
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        description: "Optional AWS Secret Access Key for dynamic SG rule whitelisting"
+        required: false
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }} (${{ inputs.target_host }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Fetch GitHub Runner Public IP
+        id: runner-ip
+        if: ${{ inputs.aws_sg_id != '' }}
+        run: |
+          RUNNER_IP=$(curl -s https://checkip.amazonaws.com)
+          echo "RUNNER_IP=${RUNNER_IP}" >> $GITHUB_ENV
+          echo "Runner IP: ${RUNNER_IP}"
+
+      - name: Configure AWS Credentials (Optional SG Whitelisting)
+        if: ${{ inputs.aws_sg_id != '' && secrets.AWS_ACCESS_KEY_ID != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Whitelist Runner IP in AWS Security Group
+        if: ${{ inputs.aws_sg_id != '' && secrets.AWS_ACCESS_KEY_ID != '' }}
+        run: |
+          echo "Temporarily whitelisting ${RUNNER_IP}/32 for port ${{ inputs.target_port }} in ${{ inputs.aws_sg_id }}..."
+          aws ec2 authorize-security-group-ingress \
+            --group-id ${{ inputs.aws_sg_id }} \
+            --protocol tcp \
+            --port ${{ inputs.target_port }} \
+            --cidr ${RUNNER_IP}/32 || true
+
+      - name: Configure SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          cat << 'SSHEOF' > ~/.ssh/config
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile=/dev/null
+            ServerAliveInterval 30
+            ServerAliveCountMax 4
+            ConnectTimeout 30
+          SSHEOF
+          chmod 600 ~/.ssh/config
+
+      - name: Execute Deployment Command
+        run: |
+          echo "Connecting to ${{ inputs.target_user }}@${{ inputs.target_host }}:${{ inputs.target_port }}..."
+          echo "Executing: ${{ inputs.deploy_cmd }}"
+          ssh -p ${{ inputs.target_port }} ${{ inputs.target_user }}@${{ inputs.target_host }} "${{ inputs.deploy_cmd }}"
+
+      - name: Revoke Runner IP from AWS Security Group
+        if: always() && inputs.aws_sg_id != '' && secrets.AWS_ACCESS_KEY_ID != ''
+        run: |
+          echo "Revoking temporary whitelisted IP ${RUNNER_IP}/32 from ${{ inputs.aws_sg_id }}..."
+          aws ec2 revoke-security-group-ingress \
+            --group-id ${{ inputs.aws_sg_id }} \
+            --protocol tcp \
+            --port ${{ inputs.target_port }} \
+            --cidr ${RUNNER_IP}/32 || true
